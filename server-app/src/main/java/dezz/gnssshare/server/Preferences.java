@@ -33,6 +33,7 @@ import java.util.Set;
 public class Preferences {
     private static final String PREF_BLUETOOTH_AUTO_START_ENABLED = "bluetoothAutoStartEnabled";
     private static final String PREF_BLUETOOTH_TRIGGER_DEVICES = "bluetoothTriggerDevices";
+    private static final String PREF_BLUETOOTH_TRANSPORT_ENABLED = "bluetoothTransportEnabled";
     private static final String PREF_FUSED_LOCATION_ENABLED = "fusedLocationEnabled";
 
     // Legacy keys for migration
@@ -48,6 +49,19 @@ public class Preferences {
 
     public static boolean bluetoothAutoStartEnabled(Context context) {
         return getPrefs(context).getBoolean(PREF_BLUETOOTH_AUTO_START_ENABLED, false);
+    }
+
+    /**
+     * When enabled, the running service also listens on an RFCOMM socket and streams
+     * the same location protocol as TCP. Off by default so existing Wi-Fi setups
+     * are unchanged until the user opts in.
+     */
+    public static void setBluetoothTransportEnabled(Context context, boolean enabled) {
+        getPrefs(context).edit().putBoolean(PREF_BLUETOOTH_TRANSPORT_ENABLED, enabled).apply();
+    }
+
+    public static boolean bluetoothTransportEnabled(Context context) {
+        return getPrefs(context).getBoolean(PREF_BLUETOOTH_TRANSPORT_ENABLED, false);
     }
 
     // Bluetooth Trigger Devices (multi-device support)

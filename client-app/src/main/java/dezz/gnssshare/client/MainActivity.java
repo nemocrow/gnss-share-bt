@@ -18,6 +18,10 @@
 package dezz.gnssshare.client;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothManager;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -25,6 +29,7 @@ import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.location.Location;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.provider.Settings;
@@ -41,8 +46,10 @@ import android.widget.Toast;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
+import androidx.appcompat.app.AlertDialog;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.appcompat.app.AppCompatDelegate;
+import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
 import androidx.core.content.IntentCompat;
@@ -57,14 +64,14 @@ import dezz.gnssshare.shared.VersionGetter;
 public class MainActivity extends AppCompatActivity {
     private static final String TAG = "GNSSClientActivity";
 
-    // Required permissions for the GNSS client
-    private static final String[] REQUIRED_PERMISSIONS = {
+    private static final String[] LOCATION_PERMISSIONS = {
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION,
     };
 
     private TextView statusText;
     private TextView connectionText;
+    private TextView connectionDetailText;
     private TextView dataAgeText;
     private TextView locationText;
     private TextView satellitesText;
@@ -80,6 +87,9 @@ public class MainActivity extends AppCompatActivity {
     private TextView serviceStatusText;
     private TextView serverIpEditLabel;
     private EditText serverIpEdit;
+    private View wifiSettingsSection;
+    private View bluetoothSettingsSection;
+    private TextView bluetoothDeviceLabel;
 
     private final Handler uiHandler = new Handler();
     private String appVersion = "<unknown>";
@@ -100,14 +110,29 @@ public class MainActivity extends AppCompatActivity {
             registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result ->
                     updatePermissionsStatus());
 
+    private final ActivityResultLauncher<String[]> bluetoothPermissionLauncher =
+            registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), result -> {
+                updatePermissionsStatus();
+                if (BluetoothConnector.hasConnectPermission(this)) {
+                    GNSSClientService.notifySettingsChanged(this);
+                } else {
+                    Toast.makeText(this, R.string.bt_error_permission, Toast.LENGTH_LONG).show();
+                }
+            });
+
     private final BroadcastReceiver connectionReceiver = new BroadcastReceiver() {
         @Override
         public void onReceive(Context context, Intent intent) {
             if ("dezz.gnssshare.CONNECTION_CHANGED".equals(intent.getAction())) {
                 String stateStr = intent.getStringExtra("state");
+                if (stateStr == null) {
+                    return;
+                }
                 ConnectionManager.ConnectionState state = ConnectionManager.ConnectionState.valueOf(stateStr);
                 String serverAddress = intent.getStringExtra("serverAddress");
-                updateConnectionStatus(state, serverAddress);
+                String message = intent.getStringExtra("message");
+                boolean failure = intent.getBooleanExtra("failure", false);
+                updateConnectionStatus(state, serverAddress, message, failure);
             }
         }
     };
@@ -164,6 +189,13 @@ public class MainActivity extends AppCompatActivity {
     }
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        updatePermissionsStatus();
+        updateBluetoothDeviceLabel();
+    }
+
+    @Override
     protected void onDestroy() {
         super.onDestroy();
 
@@ -176,6 +208,7 @@ public class MainActivity extends AppCompatActivity {
     private void initializeViews() {
         statusText = findViewById(R.id.statusText);
         connectionText = findViewById(R.id.connectionText);
+        connectionDetailText = findViewById(R.id.connectionDetailText);
         dataAgeText = findViewById(R.id.dataAgeText);
         locationText = findViewById(R.id.locationText);
         satellitesText = findViewById(R.id.satellitesText);
@@ -188,12 +221,19 @@ public class MainActivity extends AppCompatActivity {
         mockLocationStatusText = findViewById(R.id.mockLocationStatusText);
         serverIpEditLabel = findViewById(R.id.serverIpEditLabel);
         serverIpEdit = findViewById(R.id.serverIpEdit);
+        wifiSettingsSection = findViewById(R.id.wifiSettingsSection);
+        bluetoothSettingsSection = findViewById(R.id.bluetoothSettingsSection);
+        bluetoothDeviceLabel = findViewById(R.id.bluetoothDeviceLabel);
         startServiceButton = findViewById(R.id.startServiceButton);
         stopServiceButton = findViewById(R.id.stopServiceButton);
         serviceStatusText = findViewById(R.id.serviceStatusText);
 
         // Initialize with default values
-        updateConnectionStatus(GNSSClientService.getConnectionState(), GNSSClientService.getServerAddress());
+        updateConnectionStatus(
+                GNSSClientService.getConnectionState(),
+                GNSSClientService.getServerAddress(),
+                GNSSClientService.getStatusMessage(),
+                GNSSClientService.isStatusFailure());
         dataAgeText.setText(String.format(getString(R.string.data_age_status), getString(R.string.unknown)));
 
         additionalInfoText.setText(
@@ -202,6 +242,17 @@ public class MainActivity extends AppCompatActivity {
                         String.format(getString(R.string.movement_bearing), getString(R.string.unknown))
                 )
         );
+
+        boolean bluetoothTransport = Preferences.transport(this) == Preferences.Transport.BLUETOOTH;
+        RadioButton transportWifiRadio = findViewById(R.id.transportWifiRadio);
+        RadioButton transportBluetoothRadio = findViewById(R.id.transportBluetoothRadio);
+        transportWifiRadio.setChecked(!bluetoothTransport);
+        transportBluetoothRadio.setChecked(bluetoothTransport);
+        applyTransportUi();
+        updateBluetoothDeviceLabel();
+        transportWifiRadio.setOnClickListener(v -> selectTransport(Preferences.Transport.WIFI));
+        transportBluetoothRadio.setOnClickListener(v -> selectTransport(Preferences.Transport.BLUETOOTH));
+        findViewById(R.id.chooseBluetoothDeviceButton).setOnClickListener(v -> showBluetoothDevicePicker());
 
         boolean useGatewayIp = Preferences.useGatewayIp(this);
         RadioButton connectToGatewayIpRadio = findViewById(R.id.connectToGatewayIpRadioButton);
@@ -288,7 +339,7 @@ public class MainActivity extends AppCompatActivity {
         updateServiceStatus(false);
 
         // Reset connection status display
-        updateConnectionStatus(ConnectionManager.ConnectionState.DISCONNECTED, null);
+        updateConnectionStatus(ConnectionManager.ConnectionState.DISCONNECTED, null, null, false);
 
         Toast.makeText(this, getString(R.string.toast_service_disabled), Toast.LENGTH_LONG).show();
     }
@@ -311,7 +362,7 @@ public class MainActivity extends AppCompatActivity {
         List<String> permissionsToRequest = new ArrayList<>();
 
         // Check which permissions are missing
-        for (String permission : REQUIRED_PERMISSIONS) {
+        for (String permission : requiredPermissions()) {
             if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
                 permissionsToRequest.add(permission);
             }
@@ -345,7 +396,7 @@ public class MainActivity extends AppCompatActivity {
         boolean allPermissionsGranted = true;
         List<String> missingPermissions = new ArrayList<>();
 
-        for (String permission : REQUIRED_PERMISSIONS) {
+        for (String permission : requiredPermissions()) {
             if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
                 allPermissionsGranted = false;
                 missingPermissions.add(getPermissionName(permission));
@@ -387,11 +438,114 @@ public class MainActivity extends AppCompatActivity {
                     getString(R.string.permission_fine_location);
             case Manifest.permission.ACCESS_COARSE_LOCATION ->
                     getString(R.string.permission_coarse_location);
+            case Manifest.permission.BLUETOOTH_CONNECT ->
+                    getString(R.string.bluetooth_permission_name);
             default -> permission.substring(permission.lastIndexOf('.') + 1);
         };
     }
 
-    private void updateConnectionStatus(ConnectionManager.ConnectionState state, String serverAddress) {
+    private String[] requiredPermissions() {
+        if (Preferences.transport(this) == Preferences.Transport.BLUETOOTH
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return new String[]{
+                    Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION,
+                    Manifest.permission.BLUETOOTH_CONNECT,
+            };
+        }
+        return LOCATION_PERMISSIONS;
+    }
+
+    private void selectTransport(Preferences.Transport transport) {
+        boolean changed = Preferences.transport(this) != transport;
+        Preferences.setTransport(this, transport);
+        applyTransportUi();
+        updatePermissionsStatus();
+        if (transport == Preferences.Transport.BLUETOOTH) {
+            ensureBluetoothPermission();
+        }
+        if (changed) {
+            GNSSClientService.notifySettingsChanged(this);
+        }
+    }
+
+    private void applyTransportUi() {
+        boolean bluetooth = Preferences.transport(this) == Preferences.Transport.BLUETOOTH;
+        wifiSettingsSection.setVisibility(bluetooth ? View.GONE : View.VISIBLE);
+        bluetoothSettingsSection.setVisibility(bluetooth ? View.VISIBLE : View.GONE);
+    }
+
+    private void updateBluetoothDeviceLabel() {
+        if (bluetoothDeviceLabel == null) {
+            return;
+        }
+        String name = Preferences.bluetoothDeviceName(this);
+        String address = Preferences.bluetoothDeviceAddress(this);
+        if (name != null && !name.isEmpty()) {
+            bluetoothDeviceLabel.setText(getString(R.string.bluetooth_device_selected, name));
+        } else if (address != null && !address.isEmpty()) {
+            bluetoothDeviceLabel.setText(getString(R.string.bluetooth_device_selected, address));
+        } else {
+            bluetoothDeviceLabel.setText(R.string.bluetooth_device_none);
+        }
+    }
+
+    private void ensureBluetoothPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S || BluetoothConnector.hasConnectPermission(this)) {
+            return;
+        }
+        bluetoothPermissionLauncher.launch(new String[]{Manifest.permission.BLUETOOTH_CONNECT});
+    }
+
+    private void showBluetoothDevicePicker() {
+        if (!BluetoothConnector.hasConnectPermission(this)) {
+            ensureBluetoothPermission();
+            return;
+        }
+
+        BluetoothManager bluetoothManager = getSystemService(BluetoothManager.class);
+        BluetoothAdapter bluetoothAdapter = bluetoothManager != null ? bluetoothManager.getAdapter() : null;
+        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
+            Toast.makeText(this, R.string.bluetooth_adapter_unavailable, Toast.LENGTH_LONG).show();
+            return;
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                && ActivityCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+            ensureBluetoothPermission();
+            return;
+        }
+        showPairedDeviceDialog(bluetoothAdapter);
+    }
+
+    @SuppressLint("MissingPermission")
+    private void showPairedDeviceDialog(BluetoothAdapter bluetoothAdapter) {
+        java.util.Set<BluetoothDevice> pairedDevices = bluetoothAdapter.getBondedDevices();
+        if (pairedDevices == null || pairedDevices.isEmpty()) {
+            Toast.makeText(this, R.string.bluetooth_no_paired_devices, Toast.LENGTH_LONG).show();
+            return;
+        }
+
+        java.util.List<String> names = new java.util.ArrayList<>();
+        java.util.List<String> addresses = new java.util.ArrayList<>();
+        for (BluetoothDevice device : pairedDevices) {
+            String name = device.getName();
+            String address = device.getAddress();
+            names.add((name != null && !name.isEmpty()) ? name : address);
+            addresses.add(address);
+        }
+
+        new AlertDialog.Builder(this)
+                .setTitle(R.string.bluetooth_device_picker_title)
+                .setItems(names.toArray(new String[0]), (dialog, which) -> {
+                    Preferences.setBluetoothDevice(this, addresses.get(which), names.get(which));
+                    updateBluetoothDeviceLabel();
+                    GNSSClientService.notifySettingsChanged(this);
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .show();
+    }
+
+    private void updateConnectionStatus(ConnectionManager.ConnectionState state, String serverAddress, String detail, boolean failure) {
         runOnUiThread(() -> {
             statusText.setText(
                     String.format(
@@ -430,6 +584,13 @@ public class MainActivity extends AppCompatActivity {
                     );
                     connectionText.setTextColor(getColor(android.R.color.holo_red_light));
                 }
+            }
+
+            if (failure && detail != null && !detail.isEmpty() && state != ConnectionManager.ConnectionState.CONNECTED) {
+                connectionDetailText.setText(detail);
+                connectionDetailText.setVisibility(View.VISIBLE);
+            } else {
+                connectionDetailText.setVisibility(View.GONE);
             }
 
             if (state != ConnectionManager.ConnectionState.CONNECTED) {

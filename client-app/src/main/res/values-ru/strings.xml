@@ -25,6 +25,8 @@
     <string name="connection_status_connected">✓ Подключено к %s</string>
     <string name="connection_status_connecting">Подключение к %s…</string>
     <string name="connection_status_disconnected">✗ Нет подключения</string>
+    <string name="connection_lost">Соединение потеряно. Переподключение…</string>
+    <string name="wifi_disconnected">Wi-Fi отключён</string>
     <string name="data_age_status">Последнее местоположение получено: %s</string>
     <string name="data_age_format_s">%dс назад</string>
     <string name="data_age_format_ms">%1$dм %2$dс назад</string>
@@ -58,7 +60,27 @@
 
     <string name="unknown">неизвестно</string>
 
+    <string name="connection_settings_title">Подключение</string>
     <string name="select_server_address_title">Адрес сервера</string>
+    <string name="transport_wifi">Wi-Fi (TCP)</string>
+    <string name="transport_bluetooth">Bluetooth</string>
+    <string name="bluetooth_device_none">Телефон не выбран</string>
+    <string name="bluetooth_device_selected">Телефон: %s</string>
+    <string name="bluetooth_choose_device">Выбрать сопряжённый телефон</string>
+    <string name="bluetooth_device_picker_title">Сопряжённые устройства</string>
+    <string name="bluetooth_no_paired_devices">Нет сопряжённых Bluetooth-устройств. Сначала сопрягите телефон в системных настройках.</string>
+    <string name="bluetooth_adapter_unavailable">Bluetooth недоступен или выключен</string>
+    <string name="bluetooth_hint">Сопрягите головное устройство с телефоном, включите «Слушать Bluetooth-клиентов» в GPS сервере и выберите телефон. Если радио занято гарнитурой или CarPlay, текст ошибки ниже содержит сообщение стека Bluetooth, а клиент продолжает попытки.</string>
+    <string name="bluetooth_permission_name">Bluetooth</string>
+    <string name="bt_error_permission">Нет разрешения Bluetooth. Разрешите доступ к устройствам поблизости и повторите.</string>
+    <string name="bt_error_no_device">Выберите сопряжённый телефон, на котором запущен GPS сервер.</string>
+    <string name="bt_error_no_adapter">На этом устройстве нет Bluetooth-адаптера.</string>
+    <string name="bt_error_adapter_off">Bluetooth выключен.</string>
+    <string name="bt_error_not_paired">%s не сопряжён. Сопрягите его в системных настройках Bluetooth.</string>
+    <string name="bt_error_disconnected">Bluetooth-соединение с %s разорвано. Переподключение…</string>
+    <string name="bt_connecting">Открытие Bluetooth-соединения с %s…</string>
+    <string name="bt_error_failed">Не удалось подключиться по Bluetooth к %1$s: %2$s. Если подключены гарнитура или CarPlay, стек Bluetooth головного устройства может быть занят. Повтор…</string>
+    <string name="bt_error_timeout">Таймаут Bluetooth-подключения к %1$s (%2$s). Стек Bluetooth может быть занят гарнитурой или CarPlay. Повтор…</string>
     <string name="connect_to_gateway_ip">Использовать IP точки доступа</string>
     <string name="set_hostname_or_ip_address_manually">Ввести имя хоста или IP адрес вручную</string>
     <string name="editServerIp">Имя сервера или IP адрес</string>

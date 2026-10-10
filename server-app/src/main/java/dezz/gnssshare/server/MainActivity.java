@@ -96,6 +96,8 @@ public class MainActivity extends AppCompatActivity {
     private Switch bluetoothAutoStartSwitch;
     private Button addBluetoothDeviceButton;
     private LinearLayout bluetoothDeviceList;
+    private Switch bluetoothTransportSwitch;
+    private TextView bluetoothTransportStatus;
     private Switch fusedLocationSwitch;
     private TextView fusedLocationInfo;
 
@@ -128,14 +130,25 @@ public class MainActivity extends AppCompatActivity {
             registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result ->
                     updatePermissionsStatus());
 
+    private enum BluetoothPermissionNext {
+        PICK_TRIGGER_DEVICE,
+        ENABLE_TRANSPORT
+    }
+
+    private BluetoothPermissionNext bluetoothPermissionNext = BluetoothPermissionNext.PICK_TRIGGER_DEVICE;
+
     private final ActivityResultLauncher<String[]> bluetoothPermissionLauncher =
             registerForActivityResult(new ActivityResultContracts.RequestMultiplePermissions(), result -> {
-                boolean allGranted = !result.containsValue(false);
-                if (allGranted) {
-                    showBluetoothDevicePicker();
+                if (hasBluetoothPermissions()) {
+                    if (bluetoothPermissionNext == BluetoothPermissionNext.PICK_TRIGGER_DEVICE) {
+                        showBluetoothDevicePicker();
+                    } else {
+                        GNSSServerService.onBluetoothTransportPreferenceChanged();
+                    }
                 } else {
                     Toast.makeText(this, R.string.bluetooth_permission_required, Toast.LENGTH_LONG).show();
                 }
+                updateBluetoothTransportStatus();
             });
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
@@ -167,6 +180,8 @@ public class MainActivity extends AppCompatActivity {
 
         updateUIState(GNSSServerService.isServiceEnabled(this));
         updatePermissionsStatus();
+        updateBluetoothTransportStatus();
+        GNSSServerService.retryBluetoothListenerIfIdle();
 
         mainHandler.post(this.fillInterfaceListRunnable);
     }
@@ -232,7 +247,23 @@ public class MainActivity extends AppCompatActivity {
             updateBluetoothSettingsVisibility(isChecked);
         });
 
-        addBluetoothDeviceButton.setOnClickListener(v -> showBluetoothDevicePicker());
+        addBluetoothDeviceButton.setOnClickListener(v -> {
+            bluetoothPermissionNext = BluetoothPermissionNext.PICK_TRIGGER_DEVICE;
+            showBluetoothDevicePicker();
+        });
+
+        bluetoothTransportSwitch = findViewById(R.id.bluetoothTransportSwitch);
+        bluetoothTransportStatus = findViewById(R.id.bluetoothTransportStatus);
+        bluetoothTransportSwitch.setChecked(Preferences.bluetoothTransportEnabled(this));
+        bluetoothTransportSwitch.setOnCheckedChangeListener((buttonView, isChecked) -> {
+            Preferences.setBluetoothTransportEnabled(this, isChecked);
+            if (isChecked && !hasBluetoothPermissions()) {
+                bluetoothPermissionNext = BluetoothPermissionNext.ENABLE_TRANSPORT;
+                requestBluetoothPermissions();
+            }
+            GNSSServerService.onBluetoothTransportPreferenceChanged();
+            updateBluetoothTransportStatus();
+        });
 
         // Collapsible instructions
         View instructionsHeader = findViewById(R.id.instructionsHeader);
@@ -305,6 +336,14 @@ public class MainActivity extends AppCompatActivity {
         }
 
         technicalDetailsText.setText(String.format(getString(R.string.technical_details), sb));
+        updateBluetoothTransportStatus();
+    }
+
+    private void updateBluetoothTransportStatus() {
+        if (bluetoothTransportStatus == null) {
+            return;
+        }
+        bluetoothTransportStatus.setText(GNSSServerService.bluetoothStatusDetail(this));
     }
 
     private void startGNSSService() {
@@ -584,6 +623,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void showBluetoothDevicePicker() {
         if (!hasBluetoothPermissions()) {
+            bluetoothPermissionNext = BluetoothPermissionNext.PICK_TRIGGER_DEVICE;
             requestBluetoothPermissions();
             return;
         }

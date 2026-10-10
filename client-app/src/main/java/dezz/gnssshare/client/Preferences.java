@@ -21,10 +21,29 @@ import android.content.Context;
 import android.content.SharedPreferences;
 
 public class Preferences {
+    public enum Transport {
+        WIFI,
+        BLUETOOTH;
+
+        public static Transport fromPref(String value) {
+            if ("bluetooth".equals(value)) {
+                return BLUETOOTH;
+            }
+            return WIFI;
+        }
+
+        public String prefValue() {
+            return this == BLUETOOTH ? "bluetooth" : "wifi";
+        }
+    }
+
     private static final String PREF_IS_SERVICE_ENABLED = "isServiceEnabled";
     private static final String PREF_USE_GATEWAY_IP = "useGatewayIp";
     private static final String PREF_SERVER_ADDRESS = "serverAddress";
     private static final String PREF_STATIC_JITTER_ENABLED = "staticJitterEnabled";
+    private static final String PREF_TRANSPORT = "transport";
+    private static final String PREF_BLUETOOTH_DEVICE_ADDRESS = "bluetoothDeviceAddress";
+    private static final String PREF_BLUETOOTH_DEVICE_NAME = "bluetoothDeviceName";
 
     // SharedPreferences helper methods
     public static void setServiceEnabled(Context context, boolean enabled) {
@@ -57,6 +76,29 @@ public class Preferences {
 
     public static boolean staticJitterEnabled(Context context) {
         return getPrefs(context).getBoolean(PREF_STATIC_JITTER_ENABLED, false);
+    }
+
+    public static void setTransport(Context context, Transport transport) {
+        getPrefs(context).edit().putString(PREF_TRANSPORT, transport.prefValue()).apply();
+    }
+
+    public static Transport transport(Context context) {
+        return Transport.fromPref(getPrefs(context).getString(PREF_TRANSPORT, Transport.WIFI.prefValue()));
+    }
+
+    public static void setBluetoothDevice(Context context, String address, String name) {
+        getPrefs(context).edit()
+                .putString(PREF_BLUETOOTH_DEVICE_ADDRESS, address)
+                .putString(PREF_BLUETOOTH_DEVICE_NAME, name)
+                .apply();
+    }
+
+    public static String bluetoothDeviceAddress(Context context) {
+        return getPrefs(context).getString(PREF_BLUETOOTH_DEVICE_ADDRESS, null);
+    }
+
+    public static String bluetoothDeviceName(Context context) {
+        return getPrefs(context).getString(PREF_BLUETOOTH_DEVICE_NAME, null);
     }
 
     private static SharedPreferences getPrefs(Context context) {

@@ -54,6 +54,17 @@
     <string name="bluetooth_add_device_title">Add Trigger Device</string>
     <string name="bluetooth_all_devices_added">All paired devices are already added</string>
 
+    <string name="bluetooth_transport_title">Bluetooth location sharing</string>
+    <string name="bluetooth_transport_description">Also stream location over Bluetooth Classic (RFCOMM), alongside Wi-Fi on TCP port 8887. Pair this phone with the head unit, then select the phone in GNSS Client.</string>
+    <string name="bluetooth_transport_switch">Listen for Bluetooth clients</string>
+    <string name="bt_transport_disabled">Bluetooth sharing is off</string>
+    <string name="bt_transport_waiting_service">Bluetooth sharing starts when the service is running</string>
+    <string name="bt_transport_listening">Bluetooth: listening for the head unit</string>
+    <string name="bt_transport_adapter_off">Bluetooth: adapter is off</string>
+    <string name="bt_transport_permission">Bluetooth: allow Nearby devices, then open this screen again</string>
+    <string name="bt_transport_failed">Bluetooth: not listening — %s</string>
+    <string name="bt_transport_no_adapter">no Bluetooth adapter</string>
+
     <!-- Fused Location Settings -->
     <string name="fused_location_settings_title">Fused Location Provider</string>
     <string name="fused_location_settings_description">Use Google\'s Fused Location Provider for improved location accuracy by combining GPS, Wi-Fi, and cell tower data.</string>
@@ -72,5 +83,5 @@
     <string name="interface_hotspot">Wi-Fi Hotspot</string>
     <string name="interface_wifi" translatable="false">Wi-Fi</string>
     <string name="interface_none">none</string>
-    <string name="instructions">1. Enable Required Permissions:\n    • Grant all requested permissions above\n    • Enable \'Allow all the time\' for location access\n    • Allow GNSS Server app to run on background\n    • Disable battery optimizations for the app in order to prevent delays of GNSS coordinates delivering and frequent disconnections\n\n2. Enable WiFi Hotspot\n\n3. Start GNSS Server:\n    • Tap \'Enable Service\'\n    • The server will run in the background and show a persistent notification\n\n4. Connect Client Device:\n    • Install the GNSS Client app to your car system\n    • Select GNSS Client app as provider of mock locations using developer settings\n    • Launch the GNSS Client app and grant all requested permissions, if needed\n    • On your car system, connect to the WiFi hotspot\n    • Start the GNSS Client app service and ensure it connects to the server\n    • The GNSS Client app service will run in the background and show a persistent notification (if notifications are supported by a car system)</string>
+    <string name="instructions">1. Enable Required Permissions:\n    • Grant all requested permissions above\n    • Enable \'Allow all the time\' for location access\n    • Allow GNSS Server app to run on background\n    • Disable battery optimizations for the app in order to prevent delays of GNSS coordinates delivering and frequent disconnections\n\n2. Choose a transport:\n    • Wi-Fi: enable the phone hotspot. The client connects to TCP port 8887\n    • Bluetooth: enable \'Listen for Bluetooth clients\', grant Nearby devices, and pair the head unit. No hotspot is required. Wi-Fi listening stays on either way\n\n3. Start GNSS Server:\n    • Tap \'Enable Service\'\n    • The server will run in the background and show a persistent notification\n\n4. Connect Client Device:\n    • Install the GNSS Client app to your car system\n    • Select GNSS Client app as provider of mock locations using developer settings\n    • Launch the GNSS Client app and grant all requested permissions, if needed\n    • On Wi-Fi, connect the car system to the hotspot. On Bluetooth, choose Bluetooth in the client and pick this phone\n    • Start the GNSS Client app service and ensure it connects to the server\n    • The GNSS Client app service will run in the background and show a persistent notification (if notifications are supported by a car system)</string>
 </resources>
