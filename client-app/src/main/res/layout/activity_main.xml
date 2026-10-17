@@ -78,6 +78,16 @@
                     android:textSize="14sp" />
 
                 <TextView
+                    android:id="@+id/connectionDetailText"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="6dp"
+                    android:textColor="@android:color/holo_red_light"
+                    android:textIsSelectable="true"
+                    android:textSize="14sp"
+                    android:visibility="gone" />
+
+                <TextView
                     android:id="@+id/dataAgeText"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
@@ -150,14 +160,39 @@
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:layout_marginBottom="8dp"
-                    android:text="@string/select_server_address_title"
+                    android:text="@string/connection_settings_title"
                     android:textColor="@color/text_primary"
                     android:textSize="16sp"
                     android:textStyle="bold" />
 
                 <RadioGroup
+                    android:id="@+id/transportRadioGroup"
                     android:layout_width="match_parent"
-                    android:layout_height="match_parent">
+                    android:layout_height="wrap_content"
+                    android:layout_marginBottom="8dp">
+
+                    <RadioButton
+                        android:id="@+id/transportWifiRadio"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/transport_wifi" />
+
+                    <RadioButton
+                        android:id="@+id/transportBluetoothRadio"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/transport_bluetooth" />
+                </RadioGroup>
+
+                <LinearLayout
+                    android:id="@+id/wifiSettingsSection"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical">
+
+                <RadioGroup
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content">
 
                     <RadioButton
                         android:id="@+id/connectToGatewayIpRadioButton"
@@ -190,6 +225,43 @@
                     android:enabled="false"
                     android:text="192.168.43.1"
                     tools:ignore="HardcodedText" />
+                </LinearLayout>
+
+                <LinearLayout
+                    android:id="@+id/bluetoothSettingsSection"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:orientation="vertical"
+                    android:visibility="gone">
+
+                    <TextView
+                        android:id="@+id/bluetoothDeviceLabel"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/bluetooth_device_none"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="14sp" />
+
+                    <Button
+                        android:id="@+id/chooseBluetoothDeviceButton"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:backgroundTint="#9C27B0"
+                        android:padding="12dp"
+                        android:text="@string/bluetooth_choose_device"
+                        android:textColor="#ffffff"
+                        android:textSize="14sp"
+                        tools:ignore="ButtonStyle" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="8dp"
+                        android:text="@string/bluetooth_hint"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="13sp" />
+                </LinearLayout>
             </LinearLayout>
 
             <!-- Service Control Section -->

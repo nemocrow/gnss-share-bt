@@ -24,6 +24,9 @@ android {
     compileSdkVersion 36
 
     defaultConfig {
+        // Distinct from upstream dezz.gnssshare.server so this fork can be installed
+        // next to (or after) a differently signed original APK.
+        applicationId "dezz.gnssshare.bt.server"
         minSdk 24
         targetSdkVersion 36
         versionCode rootProject.ext.appVersionCode

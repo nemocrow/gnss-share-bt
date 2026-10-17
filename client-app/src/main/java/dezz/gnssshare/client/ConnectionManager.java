@@ -17,6 +17,7 @@
 
 package dezz.gnssshare.client;
 
+import android.bluetooth.BluetoothAdapter;
 import android.content.Context;
 import android.net.DhcpInfo;
 import android.net.wifi.WifiManager;
@@ -31,14 +32,18 @@ import java.util.Objects;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import dezz.gnssshare.shared.transport.GnssFraming;
+import dezz.gnssshare.shared.transport.GnssLink;
+import dezz.gnssshare.shared.transport.TcpLink;
 
 public class ConnectionManager {
     private static final String TAG = "ConnectionManager";
-    private static final int SERVER_PORT = 8887;
     private static final long RECONNECT_DELAY = 500;
     private static final long CONNECTION_CHECK_INTERVAL = 1000;
-    private static final long HEARTBEAT_INTERVAL = 1000; // Send heartbeat every second
-    private static final byte HEARTBEAT_PACKET = 0x01; // Simple heartbeat packet
+    private static final int BLUETOOTH_RECONNECT_MIN_MS = 2000;
+    private static final int BLUETOOTH_RECONNECT_MAX_MS = 15000;
 
     public enum ConnectionState {
         DISCONNECTED,
@@ -47,9 +52,9 @@ public class ConnectionManager {
     }
 
     public interface ConnectionListener {
-        void onConnectionStateChanged(ConnectionState state, String message, String serverAddress);
+        void onConnectionStateChanged(ConnectionState state, String message, String serverAddress, boolean failure);
 
-        void onConnectionEstablished(Socket socket, String serverAddress);
+        void onConnectionEstablished(GnssLink link, String serverAddress);
 
         void onDisconnected();
     }
@@ -63,9 +68,17 @@ public class ConnectionManager {
     private ConnectionState currentState = ConnectionState.DISCONNECTED;
     private String gatewayIP = null;
     private String serverAddress = null;
-    private Socket socket;
+    private GnssLink link;
     private final AtomicBoolean shutdown = new AtomicBoolean(false);
     private final AtomicBoolean isNetworkAvailable = new AtomicBoolean(false);
+    private final AtomicBoolean bluetoothRetryAllowed = new AtomicBoolean(true);
+    private final AtomicInteger connectGeneration = new AtomicInteger();
+    private int bluetoothDelayMs = BLUETOOTH_RECONNECT_MIN_MS;
+
+    private String statusMessage;
+    private boolean statusFailure;
+    private String lastNotifiedDetail;
+    private boolean lastNotifiedFailure;
 
     private final Handler heartbeatHandler = new Handler(Looper.getMainLooper());
     private final Runnable heartbeatRunnable;
@@ -80,9 +93,9 @@ public class ConnectionManager {
         this.heartbeatRunnable = new Runnable() {
             @Override
             public void run() {
-                if (currentState != ConnectionState.DISCONNECTED && socket != null) {
+                if (currentState != ConnectionState.DISCONNECTED && link != null) {
                     sendHeartbeat();
-                    heartbeatHandler.postDelayed(this, HEARTBEAT_INTERVAL);
+                    heartbeatHandler.postDelayed(this, GnssFraming.HEARTBEAT_INTERVAL_MS);
                 }
             }
         };
@@ -90,7 +103,7 @@ public class ConnectionManager {
         this.gatewayIpGetRunnable = new Runnable() {
             @Override
             public void run() {
-                if (currentState == ConnectionState.CONNECTING) {
+                if (currentState == ConnectionState.CONNECTING && !isBluetoothMode()) {
                     findGatewayIP();
                     if (gatewayIP == null) {
                         gatewayIpGetHandler.postDelayed(this, CONNECTION_CHECK_INTERVAL);
@@ -98,7 +111,7 @@ public class ConnectionManager {
                         // Now we know server address, let's update it in UI
                         setState(ConnectionState.CONNECTING, "Attempting to connect to server...", gatewayIP);
                         serverAddress = gatewayIP;
-                        doConnect();
+                        doConnect(connectGeneration.get());
                     }
                 }
             }
@@ -106,15 +119,26 @@ public class ConnectionManager {
     }
 
     private void sendHeartbeat() {
+        GnssLink current = link;
+        if (current == null) {
+            return;
+        }
         executor.execute(() -> {
             try {
-                // Send a simple heartbeat packet (1 byte)
-                socket.getOutputStream().write(HEARTBEAT_PACKET);
-                socket.getOutputStream().flush();
+                synchronized (current) {
+                    if (current.isClosed()) {
+                        return;
+                    }
+                    GnssFraming.writeHeartbeat(current.getOutputStream());
+                }
                 Log.v(TAG, "Heartbeat sent");
             } catch (IOException e) {
                 Log.w(TAG, "Failed to send heartbeat", e);
-                mainHandler.post(this::handleConnectionLoss);
+                mainHandler.post(() -> {
+                    if (link == current) {
+                        handleConnectionLoss();
+                    }
+                });
             }
         });
     }
@@ -123,7 +147,10 @@ public class ConnectionManager {
         Log.d(TAG, "Network available");
         isNetworkAvailable.set(true);
         gatewayIP = null;
-        if (!shutdown.get() && currentState == ConnectionState.DISCONNECTED) {
+        if (isBluetoothMode() || shutdown.get()) {
+            return;
+        }
+        if (currentState == ConnectionState.DISCONNECTED) {
             connect();
         }
     }
@@ -132,8 +159,91 @@ public class ConnectionManager {
         Log.d(TAG, "Network lost");
         gatewayIP = null;
         isNetworkAvailable.set(false);
-        if (!shutdown.get() && currentState != ConnectionState.DISCONNECTED) {
-            disconnect("WiFi disconnected");
+        if (isBluetoothMode() || shutdown.get()) {
+            return;
+        }
+        if (currentState != ConnectionState.DISCONNECTED) {
+            disconnect(context.getString(R.string.wifi_disconnected));
+        }
+    }
+
+    public void onBluetoothAdapterStateChanged(int state) {
+        if (!isBluetoothMode() || shutdown.get()) {
+            return;
+        }
+        if (state == BluetoothAdapter.STATE_ON) {
+            Log.i(TAG, "Bluetooth adapter is on");
+            bluetoothRetryAllowed.set(true);
+            resetBluetoothBackoff();
+            if (currentState != ConnectionState.CONNECTED) {
+                connect();
+            }
+        } else if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
+            Log.i(TAG, "Bluetooth adapter is off");
+            bluetoothRetryAllowed.set(false);
+            String message = context.getString(R.string.bt_error_adapter_off);
+            if (currentState != ConnectionState.DISCONNECTED || link != null) {
+                disconnect(message);
+            } else {
+                setState(ConnectionState.DISCONNECTED, message, serverAddress, true);
+            }
+        }
+    }
+
+    public void onBluetoothAclConnected(String address) {
+        if (!isBluetoothMode() || shutdown.get() || address == null) {
+            return;
+        }
+        String selected = Preferences.bluetoothDeviceAddress(context);
+        if (selected == null || !selected.equalsIgnoreCase(address)) {
+            return;
+        }
+        if (currentState == ConnectionState.DISCONNECTED) {
+            Log.i(TAG, "Selected Bluetooth device ACL is up, connecting");
+            bluetoothRetryAllowed.set(true);
+            resetBluetoothBackoff();
+            connect();
+        }
+    }
+
+    public void onBluetoothAclDisconnected(String address) {
+        if (!isBluetoothMode() || shutdown.get() || address == null) {
+            return;
+        }
+        String selected = Preferences.bluetoothDeviceAddress(context);
+        if (selected == null || !selected.equalsIgnoreCase(address)) {
+            return;
+        }
+        if (currentState != ConnectionState.CONNECTED) {
+            // A new attempt may already be in progress. Don't abort it because the
+            // previous RFCOMM socket closed. If we are idle, try again.
+            if (currentState == ConnectionState.DISCONNECTED) {
+                bluetoothRetryAllowed.set(true);
+                scheduleReconnect();
+            }
+            return;
+        }
+        String label = serverAddress != null ? serverAddress : address;
+        Log.i(TAG, "Bluetooth ACL dropped for " + label);
+        bluetoothRetryAllowed.set(true);
+        disconnect(context.getString(R.string.bt_error_disconnected, label));
+        scheduleReconnect();
+    }
+
+    /** Re-read transport settings and open a fresh connection. */
+    public void onSettingsChanged() {
+        if (shutdown.get()) {
+            return;
+        }
+        resetBluetoothBackoff();
+        bluetoothRetryAllowed.set(true);
+        statusMessage = null;
+        statusFailure = false;
+        lastNotifiedDetail = null;
+        lastNotifiedFailure = false;
+        disconnect("Transport settings changed", false);
+        if (isBluetoothMode() || isNetworkAvailable.get()) {
+            connect();
         }
     }
 
@@ -143,6 +253,12 @@ public class ConnectionManager {
         }
 
         if (currentState == ConnectionState.CONNECTED) {
+            return;
+        }
+
+        final int generation = connectGeneration.incrementAndGet();
+        if (isBluetoothMode()) {
+            connectBluetooth(generation);
             return;
         }
 
@@ -158,25 +274,80 @@ public class ConnectionManager {
         if (useGatewayIp && serverAddress == null) {
             gatewayIpGetHandler.post(gatewayIpGetRunnable);
         } else {
-            doConnect();
+            doConnect(generation);
         }
     }
 
-    private void doConnect() {
-        executor.execute(() -> {
-            try {
-                Log.i(TAG, "Connecting to " + serverAddress + ":" + SERVER_PORT);
-                socket = new Socket();
-                socket.connect(new InetSocketAddress(serverAddress, SERVER_PORT), 500);
-                socket.setSoTimeout(2500);
+    private void connectBluetooth(int generation) {
+        BluetoothConnector.Attempt inspected = BluetoothConnector.inspect(context);
+        serverAddress = inspected.endpoint;
+        if (!inspected.readyToConnect()) {
+            bluetoothRetryAllowed.set(inspected.retry);
+            setState(ConnectionState.CONNECTING, inspected.message, inspected.endpoint, true);
+            if (inspected.retry) {
+                scheduleReconnect();
+            }
+            return;
+        }
 
-                if (shutdown.get()) {
-                    // Connection no longer wanted
-                    try {
-                        socket.close();
-                    } catch (IOException e) {
-                        Log.w(TAG, "Error closing unwanted socket", e);
+        bluetoothRetryAllowed.set(true);
+        setState(ConnectionState.CONNECTING,
+                context.getString(R.string.bt_connecting, inspected.endpoint),
+                inspected.endpoint,
+                false);
+
+        executor.execute(() -> {
+            BluetoothConnector.Attempt attempt = BluetoothConnector.connect(context);
+            if (generation != connectGeneration.get() || shutdown.get()) {
+                if (attempt.link != null) {
+                    attempt.link.close();
+                }
+                return;
+            }
+            if (attempt.link == null) {
+                Log.w(TAG, "Bluetooth connect failed: " + attempt.message);
+                mainHandler.post(() -> {
+                    if (generation != connectGeneration.get() || shutdown.get()) {
+                        return;
                     }
+                    bluetoothRetryAllowed.set(attempt.retry);
+                    setState(ConnectionState.CONNECTING, attempt.message, attempt.endpoint, true);
+                    if (attempt.retry) {
+                        scheduleReconnect();
+                    }
+                });
+                return;
+            }
+
+            resetBluetoothBackoff();
+            link = attempt.link;
+            serverAddress = attempt.endpoint;
+            heartbeatHandler.removeCallbacks(heartbeatRunnable);
+            heartbeatHandler.post(heartbeatRunnable);
+            mainHandler.post(() -> {
+                if (generation != connectGeneration.get() || shutdown.get()) {
+                    attempt.link.close();
+                    if (link == attempt.link) {
+                        link = null;
+                    }
+                    return;
+                }
+                listener.onConnectionEstablished(attempt.link, attempt.endpoint);
+            });
+        });
+    }
+
+    private void doConnect(int generation) {
+        executor.execute(() -> {
+            Socket socket = null;
+            try {
+                Log.i(TAG, "Connecting to " + serverAddress + ":" + GnssFraming.TCP_PORT);
+                socket = new Socket();
+                socket.connect(new InetSocketAddress(serverAddress, GnssFraming.TCP_PORT), GnssFraming.TCP_CONNECT_TIMEOUT_MS);
+                socket.setSoTimeout(GnssFraming.CLIENT_READ_TIMEOUT_MS);
+
+                if (generation != connectGeneration.get() || shutdown.get()) {
+                    socket.close();
                     return;
                 }
             } catch (IOException e) {
@@ -187,30 +358,60 @@ public class ConnectionManager {
                     } catch (IOException ex) {
                         Log.w(TAG, "Error closing socket", ex);
                     }
-                    socket = null;
+                }
+                if (generation != connectGeneration.get() || shutdown.get() || isBluetoothMode()) {
+                    return;
                 }
                 scheduleReconnect();
                 return;
             }
 
+            TcpLink connected = new TcpLink(socket);
+            link = connected;
+            heartbeatHandler.removeCallbacks(heartbeatRunnable);
             heartbeatHandler.post(heartbeatRunnable);
-            mainHandler.post(() -> listener.onConnectionEstablished(socket, serverAddress));
+            String address = serverAddress;
+            mainHandler.post(() -> {
+                if (generation != connectGeneration.get() || shutdown.get()) {
+                    connected.close();
+                    if (link == connected) {
+                        link = null;
+                    }
+                    return;
+                }
+                listener.onConnectionEstablished(connected, address);
+            });
         });
     }
 
     public void disconnect(String message) {
-        setState(ConnectionState.DISCONNECTED, message, null);
+        disconnect(message, true);
+    }
+
+    /**
+     * Closes {@code active} if it is still the current link. Used by the reader thread so a
+     * newer connection, or a disconnect that already explained the failure, is left alone.
+     */
+    public void disconnectIfActive(GnssLink active, String message) {
+        if (shutdown.get() || active == null || link != active) {
+            return;
+        }
+        disconnect(message);
+        scheduleReconnect();
+    }
+
+    private void disconnect(String message, boolean failure) {
+        connectGeneration.incrementAndGet();
+        setState(ConnectionState.DISCONNECTED, message, null, failure);
 
         heartbeatHandler.removeCallbacks(heartbeatRunnable);
+        gatewayIpGetHandler.removeCallbacks(gatewayIpGetRunnable);
         mainHandler.removeCallbacksAndMessages(null);
 
-        if (socket != null) {
-            try {
-                socket.close();
-            } catch (IOException e) {
-                Log.w(TAG, "Error closing socket", e);
-            }
-            socket = null;
+        GnssLink closing = link;
+        link = null;
+        if (closing != null) {
+            closing.close();
         }
 
         listener.onDisconnected();
@@ -228,11 +429,35 @@ public class ConnectionManager {
         return serverAddress;
     }
 
+    public String getStatusMessage() {
+        return statusMessage;
+    }
+
+    public boolean isStatusFailure() {
+        return statusFailure;
+    }
+
     void setState(ConnectionState newState, String message, String serverAddress) {
-        if (currentState != newState || !Objects.equals(this.serverAddress, serverAddress)) {
+        setState(newState, message, serverAddress, false);
+    }
+
+    private void setState(ConnectionState newState, String message, String serverAddress, boolean failure) {
+        if (failure) {
+            statusMessage = message;
+            statusFailure = true;
+        } else if (newState == ConnectionState.CONNECTED) {
+            statusMessage = null;
+            statusFailure = false;
+        }
+        if (currentState != newState
+                || !Objects.equals(this.serverAddress, serverAddress)
+                || !Objects.equals(lastNotifiedDetail, statusMessage)
+                || lastNotifiedFailure != statusFailure) {
             Log.d(TAG, "State change: " + currentState + " -> " + newState + " (" + message + ")");
             currentState = newState;
-            listener.onConnectionStateChanged(newState, message, serverAddress);
+            lastNotifiedDetail = statusMessage;
+            lastNotifiedFailure = statusFailure;
+            listener.onConnectionStateChanged(newState, statusMessage, serverAddress, statusFailure);
         }
     }
 
@@ -251,18 +476,36 @@ public class ConnectionManager {
         }
 
         if (currentState == ConnectionState.CONNECTED) {
-            disconnect("Connection lost - attempting to reconnect...");
+            disconnect(context.getString(R.string.connection_lost));
             scheduleReconnect();
         }
     }
 
     public void scheduleReconnect() {
-        if (shutdown.get() || !this.isNetworkAvailable.get()) {
+        if (shutdown.get()) {
+            return;
+        }
+        if (isBluetoothMode()) {
+            if (!bluetoothRetryAllowed.get()) {
+                return;
+            }
+            int delay = consumeBluetoothDelay();
+            mainHandler.postDelayed(() -> {
+                if (!shutdown.get() && bluetoothRetryAllowed.get() && isBluetoothMode()
+                        && currentState != ConnectionState.CONNECTED) {
+                    Log.i(TAG, "Scheduling Bluetooth reconnection attempt in " + delay + "ms");
+                    connect();
+                }
+            }, delay);
+            return;
+        }
+
+        if (!this.isNetworkAvailable.get()) {
             return;
         }
 
         mainHandler.postDelayed(() -> {
-            if (!shutdown.get() && this.isNetworkAvailable.get()) {
+            if (!shutdown.get() && this.isNetworkAvailable.get() && !isBluetoothMode()) {
                 Log.i(TAG, "Scheduling reconnection attempt in " + RECONNECT_DELAY + "ms");
                 connect();
             }
@@ -271,8 +514,23 @@ public class ConnectionManager {
 
     public void shutdown() {
         shutdown.set(true);
-        disconnect("Shutting down");
+        bluetoothRetryAllowed.set(false);
+        disconnect("Shutting down", false);
         executor.shutdown();
+    }
+
+    private boolean isBluetoothMode() {
+        return Preferences.transport(context) == Preferences.Transport.BLUETOOTH;
+    }
+
+    private int consumeBluetoothDelay() {
+        int delay = bluetoothDelayMs;
+        bluetoothDelayMs = Math.min(bluetoothDelayMs * 2, BLUETOOTH_RECONNECT_MAX_MS);
+        return delay;
+    }
+
+    private void resetBluetoothBackoff() {
+        bluetoothDelayMs = BLUETOOTH_RECONNECT_MIN_MS;
     }
 
     private static String getGatewayIpAddress(Context context) {

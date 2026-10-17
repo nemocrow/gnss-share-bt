@@ -22,8 +22,12 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.ServiceInfo;
 import android.location.Location;
 import android.location.LocationManager;
@@ -32,26 +36,33 @@ import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
+import androidx.core.content.IntentCompat;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.net.Socket;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import dezz.gnssshare.proto.LocationProto;
+import dezz.gnssshare.shared.transport.GnssFraming;
+import dezz.gnssshare.shared.transport.GnssLink;
 
 public class GNSSClientService extends Service implements ConnectionManager.ConnectionListener {
     private static final String TAG = "GNSSClientService";
     private static final String CHANNEL_ID = "GNSSClientChannel";
     private static final int NOTIFICATION_ID = 1;
+    static final String ACTION_SETTINGS_CHANGED = "dezz.gnssshare.client.SETTINGS_CHANGED";
 
     private static GNSSClientService instance = null;
 
@@ -61,11 +72,15 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
     private final ExecutorService executor = Executors.newCachedThreadPool();
     private final AtomicBoolean isReceivingUpdates = new AtomicBoolean(false);
 
-    private Socket currentSocket;
+    private GnssLink currentLink;
     private Location lastReceivedLocation;
     private static long lastUpdateTime;
     private long lastLocationTimestamp = 0;
     private int lastBroadcastSatelliteCount = -1;
+    private String failureDetail;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final AtomicLong lastRxAt = new AtomicLong();
+    private Runnable receiveWatchdog;
 
     private static final String WIDGET_SATELLITE_STATUS_ACTION = "dezz.gnssshare.action.SATELLITE_STATUS";
     private static final String WIDGET_PACKAGE = "dezz.status.widget";
@@ -85,6 +100,61 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
     public static String getServerAddress() {
         return instance != null && instance.connectionManager != null ? instance.connectionManager.getServerAddress() : null;
     }
+
+    public static String getStatusMessage() {
+        return instance != null && instance.connectionManager != null ? instance.connectionManager.getStatusMessage() : null;
+    }
+
+    public static boolean isStatusFailure() {
+        return instance != null && instance.connectionManager != null && instance.connectionManager.isStatusFailure();
+    }
+
+    public static void notifySettingsChanged(Context context) {
+        Intent intent = new Intent(ACTION_SETTINGS_CHANGED);
+        intent.setPackage(context.getPackageName());
+        context.sendBroadcast(intent);
+    }
+
+    private final BroadcastReceiver bluetoothReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null || intent.getAction() == null || connectionManager == null) {
+                return;
+            }
+            switch (intent.getAction()) {
+                case BluetoothAdapter.ACTION_STATE_CHANGED -> {
+                    int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+                    connectionManager.onBluetoothAdapterStateChanged(state);
+                }
+                case BluetoothDevice.ACTION_ACL_CONNECTED -> {
+                    BluetoothDevice device = bluetoothDevice(intent);
+                    if (device != null) {
+                        connectionManager.onBluetoothAclConnected(device.getAddress());
+                    }
+                }
+                case BluetoothDevice.ACTION_ACL_DISCONNECTED -> {
+                    BluetoothDevice device = bluetoothDevice(intent);
+                    if (device != null) {
+                        connectionManager.onBluetoothAclDisconnected(device.getAddress());
+                    }
+                }
+                default -> {
+                }
+            }
+        }
+    };
+
+    private final BroadcastReceiver settingsReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (connectionManager == null) {
+                return;
+            }
+            Log.i(TAG, "Transport settings changed");
+            startAsForeground();
+            connectionManager.onSettingsChanged();
+        }
+    };
 
     private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
         @Override
@@ -107,16 +177,15 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
         connectionManager = new ConnectionManager(this, this);
 
         registerWiFiStateReceiver();
+        registerBluetoothReceivers();
         createNotificationChannel();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, createNotification(false),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else {
-            startForeground(NOTIFICATION_ID, createNotification(false));
-        }
-
         instance = this;
+        startAsForeground();
+
+        if (Preferences.transport(this) == Preferences.Transport.BLUETOOTH) {
+            connectionManager.connect();
+        }
     }
 
     private void registerWiFiStateReceiver() {
@@ -136,8 +205,20 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
     @Override
     public void onDestroy() {
         instance = null;
+        disarmReceiveWatchdog();
 
         super.onDestroy();
+
+        try {
+            unregisterReceiver(bluetoothReceiver);
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "Bluetooth receiver was not registered", e);
+        }
+        try {
+            unregisterReceiver(settingsReceiver);
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "Settings receiver was not registered", e);
+        }
 
         if (connectionManager != null) {
             connectionManager.shutdown();
@@ -151,22 +232,25 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
 
     // ConnectionManager.ConnectionListener implementation
     @Override
-    public void onConnectionStateChanged(ConnectionManager.ConnectionState state, String message, String serverAddress) {
+    public void onConnectionStateChanged(ConnectionManager.ConnectionState state, String message, String serverAddress, boolean failure) {
         Log.d(TAG, "Connection state: " + state + " - " + message);
+        failureDetail = failure ? message : null;
 
         updateNotification();
 
         // Notify activity about connection status change
         sendBroadcast(new Intent("dezz.gnssshare.CONNECTION_CHANGED")
                 .putExtra("state", state.toString())
-                .putExtra("serverAddress", serverAddress));
+                .putExtra("serverAddress", serverAddress)
+                .putExtra("message", message)
+                .putExtra("failure", failure));
     }
 
     @Override
-    public void onConnectionEstablished(Socket socket, String serverAddress) {
+    public void onConnectionEstablished(GnssLink link, String serverAddress) {
         Log.i(TAG, "Connection established, starting location updates");
 
-        this.currentSocket = socket;
+        this.currentLink = link;
         startReceivingLocationUpdates(serverAddress);
     }
 
@@ -174,24 +258,29 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
     public void onDisconnected() {
         Log.i(TAG, "Connection lost, stopping location updates");
 
-        this.currentSocket = null;
+        this.currentLink = null;
         lastLocationTimestamp = 0;
         lastBroadcastSatelliteCount = -1;
         broadcastSatelliteStatusToWidget(0);
 
         stopReceivingLocationUpdates();
 
-        // Notify activity about disconnection
+        // State callback already carried the message. Repeat it so a second
+        // observer still sees the failure text instead of a blank disconnect.
         sendBroadcast(new Intent("dezz.gnssshare.CONNECTION_CHANGED")
-                .putExtra("state", ConnectionManager.ConnectionState.DISCONNECTED.toString()));
+                .putExtra("state", ConnectionManager.ConnectionState.DISCONNECTED.toString())
+                .putExtra("message", connectionManager != null ? connectionManager.getStatusMessage() : failureDetail)
+                .putExtra("failure", connectionManager != null && connectionManager.isStatusFailure()));
     }
 
     private void startReceivingLocationUpdates(String serverAddress) {
-        if (isReceivingUpdates.get() || currentSocket == null) {
+        if (isReceivingUpdates.get() || currentLink == null) {
             return;
         }
 
         isReceivingUpdates.set(true);
+        final GnssLink link = currentLink;
+        armReceiveWatchdog(link);
 
         if (!MockLocationManager.isMockLocationEnabled(getContentResolver())) {
             Log.w(TAG, "Mock locations not enabled - please enable in Developer Options");
@@ -210,33 +299,12 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
 
         executor.execute(() -> {
             try {
-                InputStream inputStream = currentSocket.getInputStream();
+                InputStream inputStream = link.getInputStream();
 
-                while (isReceivingUpdates.get() && !currentSocket.isClosed()) {
+                while (isReceivingUpdates.get() && !link.isClosed()) {
                     try {
-                        // Read message length (4 bytes)
-                        byte[] lengthBytes = new byte[4];
-                        int bytesRead = 0;
-                        while (bytesRead < 4) {
-                            int read = inputStream.read(lengthBytes, bytesRead, 4 - bytesRead);
-                            if (read == -1) {
-                                throw new IOException("Connection closed by server");
-                            }
-                            bytesRead += read;
-                        }
-
-                        int messageLength = bytesToInt(lengthBytes);
-
-                        // Read message data
-                        byte[] messageData = new byte[messageLength];
-                        bytesRead = 0;
-                        while (bytesRead < messageLength) {
-                            int read = inputStream.read(messageData, bytesRead, messageLength - bytesRead);
-                            if (read == -1) {
-                                throw new IOException("Connection closed by server");
-                            }
-                            bytesRead += read;
-                        }
+                        byte[] messageData = GnssFraming.readFrame(inputStream);
+                        lastRxAt.set(System.currentTimeMillis());
 
                         // Parse protobuf message
                         LocationProto.ServerResponse response =
@@ -257,7 +325,7 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
                         }
                         broadcastSatelliteStatusToWidget(response.getSatellites());
                     } catch (IOException e) {
-                        if (currentSocket != null && !currentSocket.isClosed() && !currentSocket.isInputShutdown() && !currentSocket.isOutputShutdown()) {
+                        if (!link.isClosed()) {
                             Log.e(TAG, "Error receiving location update", e);
                         }
                         // Let ConnectionManager handle the reconnection
@@ -268,13 +336,14 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
                 Log.e(TAG, "Error in location update receiver", e);
             }
 
-            connectionManager.disconnect("Connection lost - attempting to reconnect...");
-            connectionManager.scheduleReconnect();
+            disarmReceiveWatchdog();
+            connectionManager.disconnectIfActive(link, getString(R.string.connection_lost));
         });
     }
 
     private void stopReceivingLocationUpdates() {
         isReceivingUpdates.set(false);
+        disarmReceiveWatchdog();
 
         // Stop providing mock locations
         if (instance == null) {
@@ -284,11 +353,34 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
         }
     }
 
-    private int bytesToInt(byte[] bytes) {
-        return ((bytes[0] & 0xFF) << 24) |
-                ((bytes[1] & 0xFF) << 16) |
-                ((bytes[2] & 0xFF) << 8) |
-                (bytes[3] & 0xFF);
+    private void armReceiveWatchdog(GnssLink link) {
+        disarmReceiveWatchdog();
+        if (link.supportsReadTimeout()) {
+            return;
+        }
+        lastRxAt.set(System.currentTimeMillis());
+        receiveWatchdog = new Runnable() {
+            @Override
+            public void run() {
+                if (!isReceivingUpdates.get() || currentLink != link) {
+                    return;
+                }
+                if (System.currentTimeMillis() - lastRxAt.get() > GnssFraming.CLIENT_READ_TIMEOUT_MS) {
+                    Log.w(TAG, "No data for " + GnssFraming.CLIENT_READ_TIMEOUT_MS + "ms, closing link");
+                    link.close();
+                    return;
+                }
+                mainHandler.postDelayed(this, 1000);
+            }
+        };
+        mainHandler.postDelayed(receiveWatchdog, GnssFraming.CLIENT_READ_TIMEOUT_MS);
+    }
+
+    private void disarmReceiveWatchdog() {
+        if (receiveWatchdog != null) {
+            mainHandler.removeCallbacks(receiveWatchdog);
+            receiveWatchdog = null;
+        }
     }
 
     private void handleLocationUpdate(LocationProto.ServerResponse response) {
@@ -389,7 +481,7 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
                         String.format(getString(R.string.notification_text_connected),
                                 (System.currentTimeMillis() - lastUpdateTime) / 1000.0) :
                         getString(R.string.notification_text_connected_no_age)) :
-                getString(R.string.notification_text_disconnected);
+                (failureDetail != null ? failureDetail : getString(R.string.notification_text_disconnected));
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
                 .setContentTitle(title)
@@ -401,8 +493,45 @@ public class GNSSClientService extends Service implements ConnectionManager.Conn
     }
 
     private void updateNotification() {
+        if (notificationManager == null) {
+            return;
+        }
         boolean isConnected = connectionManager != null && connectionManager.isConnected();
 
         notificationManager.notify(NOTIFICATION_ID, createNotification(isConnected));
+    }
+
+    private void startAsForeground() {
+        boolean connected = connectionManager != null && connectionManager.isConnected();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
+            if (Preferences.transport(this) == Preferences.Transport.BLUETOOTH
+                    && BluetoothConnector.hasConnectPermission(this)) {
+                type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+            }
+            startForeground(NOTIFICATION_ID, createNotification(connected), type);
+        } else {
+            startForeground(NOTIFICATION_ID, createNotification(connected));
+        }
+    }
+
+    private void registerBluetoothReceivers() {
+        IntentFilter bluetoothFilter = new IntentFilter();
+        bluetoothFilter.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
+        bluetoothFilter.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+        bluetoothFilter.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        ContextCompat.registerReceiver(this, bluetoothReceiver, bluetoothFilter, ContextCompat.RECEIVER_EXPORTED);
+
+        IntentFilter settingsFilter = new IntentFilter(ACTION_SETTINGS_CHANGED);
+        ContextCompat.registerReceiver(this, settingsReceiver, settingsFilter, ContextCompat.RECEIVER_NOT_EXPORTED);
+    }
+
+    private static BluetoothDevice bluetoothDevice(Intent intent) {
+        try {
+            return IntentCompat.getParcelableExtra(intent, BluetoothDevice.EXTRA_DEVICE, BluetoothDevice.class);
+        } catch (SecurityException e) {
+            Log.w(TAG, "Bluetooth device extra requires permission", e);
+            return null;
+        }
     }
 }

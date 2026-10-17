@@ -25,6 +25,8 @@
     <string name="connection_status_connected">✓ Connected to %s</string>
     <string name="connection_status_connecting">Connecting to %s…</string>
     <string name="connection_status_disconnected">✗ Disconnected</string>
+    <string name="connection_lost">Connection lost. Reconnecting…</string>
+    <string name="wifi_disconnected">Wi-Fi disconnected</string>
     <string name="data_age_status">Last location received: %s</string>
     <string name="data_age_format_s">%ds ago</string>
     <string name="data_age_format_ms">%1$dm %2$ds ago</string>
@@ -60,7 +62,27 @@
 
     <string name="unknown">unknown</string>
 
+    <string name="connection_settings_title">Connection</string>
     <string name="select_server_address_title">Server Address</string>
+    <string name="transport_wifi">Wi-Fi (TCP)</string>
+    <string name="transport_bluetooth">Bluetooth</string>
+    <string name="bluetooth_device_none">No phone selected</string>
+    <string name="bluetooth_device_selected">Phone: %s</string>
+    <string name="bluetooth_choose_device">Choose paired phone</string>
+    <string name="bluetooth_device_picker_title">Paired devices</string>
+    <string name="bluetooth_no_paired_devices">No paired Bluetooth devices. Pair the phone in system settings first.</string>
+    <string name="bluetooth_adapter_unavailable">Bluetooth is unavailable or turned off</string>
+    <string name="bluetooth_hint">Pair this head unit with the phone, turn on “Listen for Bluetooth clients” in GNSS Server, then pick the phone. If hands-free or CarPlay is using the radio, the connection error below includes the Bluetooth stack’s own message and the client keeps retrying.</string>
+    <string name="bluetooth_permission_name">Bluetooth</string>
+    <string name="bt_error_permission">Bluetooth permission denied. Grant Nearby devices access, then try again.</string>
+    <string name="bt_error_no_device">Select the paired phone that runs GNSS Server.</string>
+    <string name="bt_error_no_adapter">This device has no Bluetooth adapter.</string>
+    <string name="bt_error_adapter_off">Bluetooth is turned off.</string>
+    <string name="bt_error_not_paired">%s is not paired. Pair it in system Bluetooth settings.</string>
+    <string name="bt_error_disconnected">Bluetooth link to %s dropped. Reconnecting…</string>
+    <string name="bt_connecting">Opening Bluetooth connection to %s…</string>
+    <string name="bt_error_failed">Bluetooth connection to %1$s failed: %2$s. If hands-free or CarPlay is connected, the head unit Bluetooth stack may be busy. Retrying…</string>
+    <string name="bt_error_timeout">Timed out opening Bluetooth connection to %1$s (%2$s). The Bluetooth stack may be busy with hands-free or CarPlay. Retrying…</string>
     <string name="connect_to_gateway_ip">Use gateway IP (server on Wi-Fi mobile hotspot)</string>
     <string name="set_hostname_or_ip_address_manually">Set hostname or IP address manually</string>
     <string name="editServerIp">Server hostname or IP address</string>

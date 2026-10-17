@@ -17,14 +17,22 @@
 
 package dezz.gnssshare.server;
 
+import android.annotation.SuppressLint;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothManager;
+import android.bluetooth.BluetoothServerSocket;
+import android.bluetooth.BluetoothSocket;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.location.GnssStatus;
 import android.location.Location;
@@ -38,6 +46,7 @@ import android.util.Log;
 
 import androidx.annotation.NonNull;
 import androidx.core.app.NotificationCompat;
+import androidx.core.content.ContextCompat;
 
 import com.google.android.gms.common.ConnectionResult;
 import com.google.android.gms.common.GoogleApiAvailability;
@@ -48,19 +57,24 @@ import com.google.android.gms.location.LocationServices;
 import com.google.android.gms.location.Priority;
 
 import java.io.IOException;
-import java.io.OutputStream;
+import java.io.InputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import dezz.gnssshare.proto.LocationProto;
 import dezz.gnssshare.shared.ServerStatus;
+import dezz.gnssshare.shared.transport.BluetoothLink;
+import dezz.gnssshare.shared.transport.GnssFraming;
+import dezz.gnssshare.shared.transport.GnssLink;
+import dezz.gnssshare.shared.transport.TcpLink;
 
 public class GNSSServerService extends Service {
     private static final String TAG = "GNSSServerService";
-    private static final int PORT = 8887;
     private static final String CHANNEL_ID = "GNSSServerChannel";
     private static final int NOTIFICATION_ID = 1;
     private static final String PREF_IS_SERVICE_ENABLED = "isServiceEnabled";
@@ -70,8 +84,12 @@ public class GNSSServerService extends Service {
     private static GNSSServerService instance = null;
 
     private String serverStartError = null;
+    private volatile String bluetoothStatusDetail;
 
     private ServerSocket serverSocket;
+    private BluetoothServerSocket bluetoothServerSocket;
+    private final AtomicInteger bluetoothGeneration = new AtomicInteger();
+    private final AtomicBoolean bluetoothAutostarted = new AtomicBoolean(false);
     private LocationManager locationManager = null;
     private FusedLocationProviderClient fusedLocationProviderClient = null;
     private final com.google.android.gms.location.LocationListener fusedLocationListener = this::handleLocationUpdate;
@@ -121,21 +139,43 @@ public class GNSSServerService extends Service {
     private GnssStatus gnssStatus = null;
     private boolean isGnssActive = false;
 
+    private final BroadcastReceiver bluetoothAdapterReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            if (intent == null || !BluetoothAdapter.ACTION_STATE_CHANGED.equals(intent.getAction())) {
+                return;
+            }
+            if (!Preferences.bluetoothTransportEnabled(GNSSServerService.this)) {
+                return;
+            }
+            int state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR);
+            if (state == BluetoothAdapter.STATE_ON) {
+                Log.i(TAG, "Bluetooth adapter on, restarting RFCOMM listener");
+                restartBluetoothListener();
+            } else if (state == BluetoothAdapter.STATE_OFF || state == BluetoothAdapter.STATE_TURNING_OFF) {
+                Log.i(TAG, "Bluetooth adapter off, stopping RFCOMM listener");
+                stopBluetoothListener();
+                setBluetoothStatus(getString(R.string.bt_transport_adapter_off));
+            }
+        }
+    };
+
     @Override
     public void onCreate() {
         notificationManager = getSystemService(NotificationManager.class);
 
         createNotificationChannel();
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIFICATION_ID, createNotification(),
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION);
-        } else {
-            startForeground(NOTIFICATION_ID, createNotification());
-        }
-
         running = true;
         instance = this;
+
+        ContextCompat.registerReceiver(
+                this,
+                bluetoothAdapterReceiver,
+                new IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
+                ContextCompat.RECEIVER_EXPORTED);
+
+        refreshForegroundNotification();
     }
 
     @Override
@@ -150,6 +190,12 @@ public class GNSSServerService extends Service {
     public void onDestroy() {
         running = false;
         instance = null;
+
+        try {
+            unregisterReceiver(bluetoothAdapterReceiver);
+        } catch (IllegalArgumentException e) {
+            Log.w(TAG, "Bluetooth adapter receiver was not registered", e);
+        }
 
         cancelBluetoothAutoStop();
         stopServer();
@@ -227,8 +273,8 @@ public class GNSSServerService extends Service {
     private void startServer() {
         executor.execute(() -> {
             try {
-                serverSocket = new ServerSocket(PORT);
-                Log.d(TAG, "Server started on port " + PORT);
+                serverSocket = new ServerSocket(GnssFraming.TCP_PORT);
+                Log.d(TAG, "Server started on port " + GnssFraming.TCP_PORT);
             } catch (Throwable e) {
                 Log.e(TAG, "Error starting server", e);
                 serverStartError = e.getMessage();
@@ -240,21 +286,7 @@ public class GNSSServerService extends Service {
                 try {
                     Socket clientSocket = serverSocket.accept();
                     Log.d(TAG, "Client connected: " + clientSocket.getRemoteSocketAddress());
-
-                    ClientHandler clientHandler = new ClientHandler(clientSocket);
-                    synchronized (connectedClients) {
-                        connectedClients.add(clientHandler);
-                        // Start location updates when first client connects
-                        if (connectedClients.size() == 1) {
-                            mainHandler.post(this::startLocationUpdates);
-                        }
-                    }
-                    executor.execute(clientHandler);
-
-                    // Cancel any pending BT auto-stop since a client just connected
-                    cancelBluetoothAutoStop();
-
-                    updateNotification("New client connected");
+                    acceptClient(new TcpLink(clientSocket));
                 } catch (IOException e) {
                     if (serverSocket != null && !serverSocket.isClosed()) {
                         Log.e(TAG, "Error accepting client connection", e);
@@ -262,10 +294,36 @@ public class GNSSServerService extends Service {
                 }
             }
         });
+
+        if (bluetoothAutostarted.compareAndSet(false, true)) {
+            if (Preferences.bluetoothTransportEnabled(this)) {
+                restartBluetoothListener();
+            } else {
+                setBluetoothStatus(getString(R.string.bt_transport_disabled));
+            }
+        }
+    }
+
+    private void acceptClient(GnssLink link) {
+        ClientHandler clientHandler = new ClientHandler(link);
+        synchronized (connectedClients) {
+            connectedClients.add(clientHandler);
+            // Start location updates when first client connects
+            if (connectedClients.size() == 1) {
+                mainHandler.post(this::startLocationUpdates);
+            }
+        }
+        executor.execute(clientHandler);
+
+        // Cancel any pending BT auto-stop since a client just connected
+        cancelBluetoothAutoStop();
+
+        updateNotification("New client connected");
     }
 
     private void stopServer() {
         Log.d(TAG, "Stopping server");
+        stopBluetoothListener();
         try {
             if (serverSocket != null) {
                 if (!serverSocket.isClosed()) {
@@ -494,6 +552,10 @@ public class GNSSServerService extends Service {
             } else {
                 content += getString(R.string.notification_gnss_inactive);
             }
+
+            if (Preferences.bluetoothTransportEnabled(this) && bluetoothStatusDetail != null) {
+                content += getString(R.string.notification_divider) + bluetoothStatusDetail;
+            }
         } else {
             content = serverStartError;
         }
@@ -589,6 +651,212 @@ public class GNSSServerService extends Service {
         mainHandler.removeCallbacks(btAutoStopRunnable);
     }
 
+    /**
+     * Called when the user toggles Bluetooth location sharing.
+     * Wi-Fi/TCP keeps running either way.
+     */
+    public static void onBluetoothTransportPreferenceChanged() {
+        if (instance != null) {
+            instance.applyBluetoothTransportPreference();
+        }
+    }
+
+    /** Restarts the RFCOMM listener when it is not already accepting. Safe to call from the UI. */
+    public static void retryBluetoothListenerIfIdle() {
+        if (instance != null) {
+            instance.retryBluetoothIfIdle();
+        }
+    }
+
+    public static String bluetoothStatusDetail(Context context) {
+        if (!Preferences.bluetoothTransportEnabled(context)) {
+            return context.getString(R.string.bt_transport_disabled);
+        }
+        if (instance == null || instance.bluetoothStatusDetail == null) {
+            return context.getString(R.string.bt_transport_waiting_service);
+        }
+        return instance.bluetoothStatusDetail;
+    }
+
+    private void applyBluetoothTransportPreference() {
+        refreshForegroundNotification();
+        if (Preferences.bluetoothTransportEnabled(this)) {
+            restartBluetoothListener();
+        } else {
+            stopBluetoothListener();
+            disconnectBluetoothClients();
+            setBluetoothStatus(getString(R.string.bt_transport_disabled));
+        }
+    }
+
+    private void retryBluetoothIfIdle() {
+        if (!running || !Preferences.bluetoothTransportEnabled(this)) {
+            return;
+        }
+        synchronized (this) {
+            if (bluetoothServerSocket != null) {
+                return;
+            }
+        }
+        restartBluetoothListener();
+    }
+
+    private void refreshForegroundNotification() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            int type = ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION;
+            // connectedDevice is only legal once a Bluetooth runtime permission is held.
+            // Without it, startForeground throws and would take down Wi-Fi sharing too.
+            if (Preferences.bluetoothTransportEnabled(this) && hasBluetoothConnectPermission()) {
+                type |= ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE;
+            }
+            startForeground(NOTIFICATION_ID, createNotification(), type);
+        } else {
+            startForeground(NOTIFICATION_ID, createNotification());
+        }
+    }
+
+    private void restartBluetoothListener() {
+        final int generation = bluetoothGeneration.incrementAndGet();
+        closeBluetoothServerSocket();
+        if (!running || !Preferences.bluetoothTransportEnabled(this)) {
+            setBluetoothStatus(getString(R.string.bt_transport_disabled));
+            return;
+        }
+        executor.execute(() -> listenBluetooth(generation));
+    }
+
+    private void stopBluetoothListener() {
+        bluetoothGeneration.incrementAndGet();
+        closeBluetoothServerSocket();
+    }
+
+    private void closeBluetoothServerSocket() {
+        BluetoothServerSocket server;
+        synchronized (this) {
+            server = bluetoothServerSocket;
+            bluetoothServerSocket = null;
+        }
+        if (server != null) {
+            try {
+                server.close();
+            } catch (IOException e) {
+                Log.w(TAG, "Error closing Bluetooth server socket", e);
+            }
+        }
+    }
+
+    private void disconnectBluetoothClients() {
+        ArrayList<ClientHandler> clients;
+        synchronized (connectedClients) {
+            clients = new ArrayList<>(connectedClients);
+        }
+        for (ClientHandler client : clients) {
+            if (client.getKind() == GnssLink.Kind.BLUETOOTH) {
+                client.disconnect();
+            }
+        }
+    }
+
+    private void setBluetoothStatus(String detail) {
+        bluetoothStatusDetail = detail;
+        Log.i(TAG, "Bluetooth transport: " + detail);
+        mainHandler.post(() -> updateNotification("Bluetooth status"));
+    }
+
+    @SuppressLint("MissingPermission")
+    private void listenBluetooth(int generation) {
+        if (generation != bluetoothGeneration.get() || !running) {
+            return;
+        }
+        if (!hasBluetoothConnectPermission()) {
+            setBluetoothStatus(getString(R.string.bt_transport_permission));
+            return;
+        }
+        BluetoothAdapter adapter = bluetoothAdapter();
+        if (adapter == null) {
+            setBluetoothStatus(getString(R.string.bt_transport_failed, getString(R.string.bt_transport_no_adapter)));
+            return;
+        }
+        if (!adapter.isEnabled()) {
+            setBluetoothStatus(getString(R.string.bt_transport_adapter_off));
+            return;
+        }
+
+        BluetoothServerSocket server = null;
+        try {
+            Log.i(TAG, "Listening for RFCOMM clients, SDP \"" + GnssFraming.RFCOMM_SDP_NAME
+                    + "\" uuid " + GnssFraming.RFCOMM_UUID);
+            server = adapter.listenUsingRfcommWithServiceRecord(
+                    GnssFraming.RFCOMM_SDP_NAME, GnssFraming.RFCOMM_UUID);
+            synchronized (this) {
+                if (generation != bluetoothGeneration.get() || !running) {
+                    server.close();
+                    return;
+                }
+                bluetoothServerSocket = server;
+            }
+            setBluetoothStatus(getString(R.string.bt_transport_listening));
+
+            while (generation == bluetoothGeneration.get() && running) {
+                BluetoothSocket client = server.accept();
+                if (generation != bluetoothGeneration.get() || !running) {
+                    client.close();
+                    break;
+                }
+                Log.i(TAG, "Bluetooth client connected");
+                acceptClient(new BluetoothLink(client));
+            }
+        } catch (SecurityException e) {
+            Log.e(TAG, "Bluetooth listen permission denied", e);
+            if (generation == bluetoothGeneration.get()) {
+                setBluetoothStatus(getString(R.string.bt_transport_permission));
+            }
+        } catch (IOException e) {
+            if (generation != bluetoothGeneration.get() || !running) {
+                return;
+            }
+            BluetoothAdapter current = bluetoothAdapter();
+            if (current == null || !current.isEnabled()) {
+                setBluetoothStatus(getString(R.string.bt_transport_adapter_off));
+                return;
+            }
+            String detail = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
+            Log.w(TAG, "Bluetooth listen failed: " + detail, e);
+            setBluetoothStatus(getString(R.string.bt_transport_failed, detail));
+            mainHandler.postDelayed(() -> {
+                if (generation == bluetoothGeneration.get() && running
+                        && Preferences.bluetoothTransportEnabled(this)) {
+                    executor.execute(() -> listenBluetooth(generation));
+                }
+            }, 5000);
+        } finally {
+            if (server != null) {
+                try {
+                    server.close();
+                } catch (IOException ignored) {
+                }
+            }
+            synchronized (this) {
+                if (bluetoothServerSocket == server) {
+                    bluetoothServerSocket = null;
+                }
+            }
+        }
+    }
+
+    private boolean hasBluetoothConnectPermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) {
+            return true;
+        }
+        return ContextCompat.checkSelfPermission(this, android.Manifest.permission.BLUETOOTH_CONNECT)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private BluetoothAdapter bluetoothAdapter() {
+        BluetoothManager manager = getSystemService(BluetoothManager.class);
+        return manager != null ? manager.getAdapter() : null;
+    }
+
     private void btAutoStopService() {
         // Safety net: re-check conditions before stopping
         boolean btGone = BluetoothReceiver.allTriggerDevicesDisconnected();
@@ -606,54 +874,76 @@ public class GNSSServerService extends Service {
     }
 
     private class ClientHandler implements Runnable {
-        private static final long HEARTBEAT_TIMEOUT = 3000;
-        private static final byte HEARTBEAT_PACKET = 0x01; // Expected heartbeat packet
-        private static final long RESPONSE_TIMING_REQUIREMENT = 1000;
-
-        private final Socket socket;
+        private final GnssLink link;
         private final String clientAddress;
-        private long lastHeartbeatTime;
+        private final AtomicBoolean closed = new AtomicBoolean(false);
+        private volatile long lastHeartbeatTime;
         private long lastResponseTime = 0;
 
-        public ClientHandler(Socket socket) {
-            this.socket = socket;
-            this.clientAddress = socket.getRemoteSocketAddress().toString();
+        private final Runnable heartbeatWatchdog = new Runnable() {
+            @Override
+            public void run() {
+                if (closed.get()) {
+                    return;
+                }
+                long timeSinceLastHeartbeat = System.currentTimeMillis() - lastHeartbeatTime;
+                if (timeSinceLastHeartbeat > GnssFraming.HEARTBEAT_TIMEOUT_MS) {
+                    Log.w(TAG, "Heartbeat timeout for client: " + clientAddress +
+                            " (last heartbeat " + timeSinceLastHeartbeat + "ms ago)");
+                    disconnect();
+                    return;
+                }
+                mainHandler.postDelayed(this, GnssFraming.SERVER_READ_TIMEOUT_MS);
+            }
+        };
+
+        public ClientHandler(GnssLink link) {
+            this.link = link;
+            this.clientAddress = link.getRemoteName();
             this.lastHeartbeatTime = System.currentTimeMillis();
 
-            Log.i(TAG, "New client connected: " + clientAddress);
+            Log.i(TAG, "New client connected: " + clientAddress + " via " + link.getKind());
         }
 
         public String getClientAddress() {
             return clientAddress;
         }
 
+        public GnssLink.Kind getKind() {
+            return link.getKind();
+        }
+
         @Override
         public void run() {
+            boolean readTimesOut = link.applyReadTimeout(GnssFraming.SERVER_READ_TIMEOUT_MS);
+            if (!readTimesOut) {
+                // Bluetooth reads block until the peer writes or the socket is closed.
+                mainHandler.postDelayed(heartbeatWatchdog, GnssFraming.SERVER_READ_TIMEOUT_MS);
+            }
             try {
-                // Set socket timeout for heartbeat detection
-                socket.setSoTimeout(1000); // timeout for reads
                 sendResponse(lastServerResponse.build());
 
-                // Keep connection alive and handle request packets
+                InputStream input = link.getInputStream();
                 byte[] buffer = new byte[1];
-                while (!socket.isClosed()) {
+                while (!closed.get()) {
                     try {
-                        // Try to read request packet
-                        int result = socket.getInputStream().read(buffer);
-                        if (socket.isClosed()) {
+                        int result = input.read(buffer);
+                        if (closed.get()) {
+                            Log.i(TAG, "Client closed connection: " + clientAddress);
+                            break;
+                        }
+                        if (result < 0) {
                             Log.i(TAG, "Client closed connection: " + clientAddress);
                             break;
                         }
                         if (result > 0) {
-                            // Received data from client
-                            if (buffer[0] == HEARTBEAT_PACKET) {
-                                // Valid heartbeat packet received
+                            if (buffer[0] == GnssFraming.HEARTBEAT) {
                                 lastHeartbeatTime = System.currentTimeMillis();
                                 Log.v(TAG, "Heartbeat received from: " + clientAddress);
 
-                                // Send response if last response was sent more than RESPONSE_TIMING_REQUIREMENT ago
-                                // so the client will be sure that the server is still alive
-                                if (lastResponseTime < lastHeartbeatTime - RESPONSE_TIMING_REQUIREMENT ||
+                                // Send a response if the last one is older than RESPONSE_INTERVAL_MS,
+                                // so the client can tell the server is still alive.
+                                if (lastResponseTime < lastHeartbeatTime - GnssFraming.RESPONSE_INTERVAL_MS ||
                                         !lastServerResponse.hasLocationUpdate()) {
                                     sendResponse(lastServerResponse.build());
                                 }
@@ -669,14 +959,15 @@ public class GNSSServerService extends Service {
                         break;
                     }
 
-                    // Check if heartbeat timeout exceeded
-                    // This will be processed after the timeout exception as well as after receiving
-                    // an unknown packet
-                    long timeSinceLastHeartbeat = System.currentTimeMillis() - lastHeartbeatTime;
-                    if (timeSinceLastHeartbeat > HEARTBEAT_TIMEOUT) {
-                        Log.w(TAG, "Heartbeat timeout for client: " + clientAddress +
-                                " (last heartbeat " + timeSinceLastHeartbeat + "ms ago)");
-                        break;
+                    // Checked after a read timeout and after an unknown packet.
+                    // Bluetooth uses heartbeatWatchdog instead, because its reads do not time out.
+                    if (readTimesOut) {
+                        long timeSinceLastHeartbeat = System.currentTimeMillis() - lastHeartbeatTime;
+                        if (timeSinceLastHeartbeat > GnssFraming.HEARTBEAT_TIMEOUT_MS) {
+                            Log.w(TAG, "Heartbeat timeout for client: " + clientAddress +
+                                    " (last heartbeat " + timeSinceLastHeartbeat + "ms ago)");
+                            break;
+                        }
                     }
                 }
             } catch (Exception e) {
@@ -687,19 +978,17 @@ public class GNSSServerService extends Service {
         }
 
         private void sendResponse(LocationProto.ServerResponse response) {
-            if (socket.isClosed()) {
+            if (closed.get() || link.isClosed()) {
                 return;
             }
             try {
-                byte[] data = response.toByteArray();
-                // Send length first (4 bytes) then data
-                OutputStream output = socket.getOutputStream();
-                output.write(intToBytes(data.length));
-                output.write(data);
-                output.flush();
-
+                synchronized (link) {
+                    if (closed.get() || link.isClosed()) {
+                        return;
+                    }
+                    GnssFraming.writeFrame(link.getOutputStream(), response.toByteArray());
+                }
                 Log.v(TAG, "Response sent to: " + clientAddress);
-
                 lastResponseTime = System.currentTimeMillis();
             } catch (IOException e) {
                 Log.w(TAG, "Error sending location update to client", e);
@@ -708,22 +997,12 @@ public class GNSSServerService extends Service {
         }
 
         public void disconnect() {
-            try {
-                socket.close();
-            } catch (IOException e) {
-                Log.e(TAG, "Error closing client socket", e);
+            if (!closed.compareAndSet(false, true)) {
+                return;
             }
-
+            mainHandler.removeCallbacks(heartbeatWatchdog);
+            link.close();
             onClientDisconnected(this);
-        }
-
-        private byte[] intToBytes(int value) {
-            return new byte[]{
-                    (byte) (value >>> 24),
-                    (byte) (value >>> 16),
-                    (byte) (value >>> 8),
-                    (byte) value
-            };
         }
     }
 }

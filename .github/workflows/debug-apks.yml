@@ -1,0 +1,105 @@
+name: Debug APKs
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build debug APKs
+    runs-on: ubuntu-latest
+    # Publishing a main build creates a debug-<sha> tag. Skip that follow-up run
+    # so the tag push does not build the same commit again.
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.ref_type == 'branch' ||
+      startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: "21"
+          distribution: temurin
+          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v2
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Build debug APKs
+        env:
+          # Tag builds use the tag as the version. Other refs stay on the default
+          # v1.0.0 so versionCode parsing in the root build script still succeeds.
+          VERSION_NAME: ${{ github.ref_type == 'tag' && github.ref_name || 'v1.0.0' }}
+        run: ./gradlew :server-app:assembleDebug :client-app:assembleDebug --stacktrace
+
+      - name: Collect APKs
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          server_apk="$(find server-app/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
+          client_apk="$(find client-app/build/outputs/apk/debug -type f -name '*.apk' -print -quit)"
+          if [[ -z "${server_apk}" || -z "${client_apk}" ]]; then
+            echo "Debug APKs were not produced" >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            server_name="gnss-server-${GITHUB_REF_NAME}-debug.apk"
+            client_name="gnss-client-${GITHUB_REF_NAME}-debug.apk"
+          else
+            server_name="gnss-server-debug.apk"
+            client_name="gnss-client-debug.apk"
+          fi
+          cp "${server_apk}" "dist/${server_name}"
+          cp "${client_apk}" "dist/${client_name}"
+          ls -lh dist
+
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-apks-${{ github.sha }}
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Publish debug APKs to GitHub Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          notes="Debug APKs built from \`${GITHUB_SHA}\` (\`${GITHUB_REF_NAME}\`)."
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            tag="${GITHUB_REF_NAME}"
+            title="Release ${tag}"
+            prerelease=false
+          else
+            tag="debug-${GITHUB_SHA}"
+            title="Debug APKs (${short_sha})"
+            prerelease=true
+          fi
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" dist/*.apk --clobber
+          elif [[ "${prerelease}" == true ]]; then
+            gh release create "${tag}" dist/*.apk \
+              --title "${title}" \
+              --notes "${notes}" \
+              --target "${GITHUB_SHA}" \
+              --prerelease
+          else
+            gh release create "${tag}" dist/*.apk \
+              --title "${title}" \
+              --notes "${notes}" \
+              --target "${GITHUB_SHA}"
+          fi
