@@ -45,6 +45,11 @@ cd gnss-share
 ./gradlew assembleDebug
 ```
 
+Package IDs for this fork (different from upstream DezzK, so they install as separate apps):
+
+- Server: `dezz.gnssshare.bt.server`
+- Client: `dezz.gnssshare.bt.client`
+
 ## Usage Instructions
 
 ### Wi-Fi (existing mode)
