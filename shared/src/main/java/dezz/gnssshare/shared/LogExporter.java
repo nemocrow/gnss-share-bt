@@ -40,7 +40,11 @@ public class LogExporter {
             new SimpleDateFormat("yyyy-MM-dd--HH-mm-ss", Locale.US);
 
     /**
-     * Export logs to a file in the app's cache directory
+     * Export logs to a file in the app's cache directory.
+     * <p>
+     * Includes the system crash buffer (so a stack trace can survive process
+     * restart), then the current process dump. Dumping only {@code --pid=} was
+     * dropping FATAL EXCEPTION lines after the app had already restarted.
      *
      * @param context Application context
      * @return File object pointing to the exported logs, or null if failed
@@ -51,33 +55,100 @@ public class LogExporter {
             return null;
         }
 
-        try {
-            Process process = Runtime.getRuntime().exec("logcat -d *:V --pid=" + android.os.Process.myPid());
-            BufferedReader reader = new BufferedReader(
-                    new InputStreamReader(process.getInputStream())
-            );
-            FileOutputStream output = new FileOutputStream(logFile);
-            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(output));
+        try (FileOutputStream output = new FileOutputStream(logFile);
+             BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(output))) {
+            writer.append("=== GNSS Share log export ===\n");
+            writer.append("package=").append(context.getPackageName()).append('\n');
+            writer.append("pid=").append(String.valueOf(android.os.Process.myPid())).append('\n');
+            writer.append("time=").append(DATE_FORMAT.format(new Date())).append("\n\n");
 
-            String line;
-            while ((line = reader.readLine()) != null) {
-                writer.append(line).append("\n");
-            }
+            // Crash buffer survives process death briefly and is small.
+            writer.append("--- logcat -b crash ---\n");
+            dumpLogcat(writer, "logcat", "-d", "-b", "crash", "*:V");
 
-            writer.close();
-            output.close();
-            reader.close();
+            // Fatal / error lines for this package may still be in main after restart.
+            writer.append("\n--- logcat main (AndroidRuntime / FATAL / package) ---\n");
+            dumpFilteredMain(writer, context.getPackageName());
 
-            if (process.waitFor() != 0) {
-                Log.e(TAG, "Failed to export logs, logcat command exited with result = " + process.exitValue());
-                return null;
-            }
+            // Full dump for the live process (UI + service in this PID).
+            writer.append("\n--- logcat current pid ---\n");
+            dumpLogcat(writer, "logcat", "-d", "*:V",
+                    "--pid=" + android.os.Process.myPid());
 
+            writer.flush();
             Log.d(TAG, "Logs exported to: " + logFile.getAbsolutePath());
             return logFile;
-        } catch (IOException | InterruptedException e) {
+        } catch (IOException e) {
             Log.e(TAG, "Error exporting logs", e);
             return null;
+        }
+    }
+
+    private static void dumpFilteredMain(BufferedWriter writer, String packageName) throws IOException {
+        Process process = new ProcessBuilder("logcat", "-d", "-b", "main", "*:V")
+                .redirectErrorStream(true)
+                .start();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            int kept = 0;
+            final int maxKept = 2000;
+            while ((line = reader.readLine()) != null) {
+                if (isInterestingCrashLine(line, packageName)) {
+                    writer.append(line).append('\n');
+                    kept++;
+                    if (kept >= maxKept) {
+                        writer.append("... truncated after ").append(String.valueOf(maxKept))
+                                .append(" matching lines\n");
+                        break;
+                    }
+                }
+            }
+            if (kept == 0) {
+                writer.append("(no AndroidRuntime / FATAL / package matches in main buffer)\n");
+            }
+        } finally {
+            process.destroy();
+        }
+        try {
+            process.waitFor();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private static boolean isInterestingCrashLine(String line, String packageName) {
+        return line.contains("AndroidRuntime")
+                || line.contains("FATAL EXCEPTION")
+                || line.contains("Fatal signal")
+                || line.contains("crash_dump")
+                || line.contains(packageName)
+                || line.contains("dezz.gnssshare");
+    }
+
+    private static void dumpLogcat(BufferedWriter writer, String... command) throws IOException {
+        Process process = new ProcessBuilder(command)
+                .redirectErrorStream(true)
+                .start();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            String line;
+            boolean any = false;
+            while ((line = reader.readLine()) != null) {
+                writer.append(line).append('\n');
+                any = true;
+            }
+            if (!any) {
+                writer.append("(empty)\n");
+            }
+        } finally {
+            process.destroy();
+        }
+        try {
+            if (process.waitFor() != 0) {
+                Log.w(TAG, "logcat exited with " + process.exitValue()
+                        + " for " + Arrays.toString(command));
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
